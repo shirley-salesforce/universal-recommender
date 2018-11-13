@@ -17,13 +17,23 @@
 
 package com.actionml
 
-import org.apache.predictionio.controller.{ EmptyActualResult, EmptyEvaluationInfo, PDataSource, Params }
+import org.apache.predictionio.controller.{
+  EmptyActualResult,
+  EmptyEvaluationInfo,
+  PDataSource,
+  Params
+}
+import org.apache.predictionio.data.storage.DataMap
 import org.apache.predictionio.data.storage.PropertyMap
 import org.apache.predictionio.data.store.PEventStore
+import org.apache.predictionio.data.storage.Event
 import grizzled.slf4j.Logger
 import org.apache.predictionio.core.{ EventWindow, SelfCleaningDataSource }
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
+import org.json4s.JObject
+import org.json4s.DefaultFormats
+import org.json4s.native.Serialization
 import com.actionml.helpers.{ ActionID, ItemID }
 import com.actionml.helpers._
 
@@ -54,12 +64,14 @@ class DataSource(val dsp: DataSourceParams)
   override def appName: String = dsp.appName
   override def eventWindow: Option[EventWindow] = dsp.eventWindow
 
-  drawInfo("Init DataSource", Seq(
-    ("══════════════════════════════", "════════════════════════════"),
-    ("App name", appName),
-    ("Event window", eventWindow),
-    ("Event names", dsp.eventNames),
-    ("Min events per user", dsp.minEventsPerUser)))
+  drawInfo(
+    "Init DataSource",
+    Seq(
+      ("══════════════════════════════", "════════════════════════════"),
+      ("App name", appName),
+      ("Event window", eventWindow),
+      ("Event names", dsp.eventNames),
+      ("Min events per user", dsp.minEventsPerUser)))
 
   /** Reads events from PEventStore and create and RDD for each */
   override def readTraining(sc: SparkContext): TrainingData = {
@@ -69,32 +81,71 @@ class DataSource(val dsp: DataSourceParams)
     // beware! the following call most likely will alter the event stream in the DB!
     cleanPersistedPEvents(sc) // broken in apache-pio v0.10.0-incubating it erases all data!!!!!!
 
-    val eventsRDD = PEventStore.find(
-      appName = dsp.appName,
-      entityType = Some("user"),
-      eventNames = Some(eventNames),
-      targetEntityType = Some(Some("item")))(sc).repartition(sc.defaultParallelism)
+    val eventsRDD = PEventStore
+      .find(
+        appName = dsp.appName,
+        entityType = Some("user"),
+        eventNames = Some(eventNames),
+        targetEntityType = Some(Some("item")))(sc)
+      .repartition(sc.defaultParallelism)
+
+    logger.info(s"eventsRDD events ${eventsRDD.first()}")
+
+    val fieldsRDD: RDD[(ItemID, PropertyMap)] = eventsRDD
+      .filter { event =>
+        event.tags != null
+      }
+      .map { event =>
+        {
+          implicit val formats = DefaultFormats
+          val ss = """{ "categories": ["""" + event.tags.mkString(",") + """"] }"""
+          (
+            event.eventId.get + "_" + event.targetEntityId.get,
+            (ss, event.eventTime, event.eventTime))
+        }
+      }
+      .reduceByKey { (accum, item) =>
+        (
+          accum._1,
+          if (accum._2.isBefore(item._2)) accum._2 else item._2,
+          if (accum._3.isAfter(item._3)) accum._3
+          else item._3)
+      }
+      .map { case (k, v) => (k, PropertyMap.apply(v._1, v._2, v._3)) }
+
+    logger.info(s"fieldsRDD: ${fieldsRDD.first()}")
+    logger.info(s"event names ${eventNames}")
 
     // now separate the events by event name
-    val eventRDDs: List[(ActionID, RDD[(UserID, ItemID)])] = eventNames.map { eventName =>
-      val singleEventRDD = eventsRDD.filter { event =>
-        require(eventNames.contains(event.event), s"Unexpected event $event is read.") // is this really needed?
-        require(event.entityId.nonEmpty && event.targetEntityId.get.nonEmpty, "Empty user or item ID")
-        eventName.equals(event.event)
-      }.map { event =>
-        (event.entityId, event.targetEntityId.get)
-      }
+    val eventRDDs: List[(ActionID, RDD[(UserID, ItemID)])] = eventNames.map {
+      eventName =>
+        val singleEventRDD = eventsRDD
+          .filter { event =>
+            require(
+              eventNames.contains(event.event),
+              s"Unexpected event $event is read.") // is this really needed?
+            require(
+              event.entityId.nonEmpty && event.targetEntityId.get.nonEmpty,
+              "Empty user or item ID")
+            eventName.equals(event.event)
+          }
+          .map { event =>
+            (event.entityId, event.targetEntityId.get)
+          }
 
-      (eventName, singleEventRDD)
+        (eventName, singleEventRDD)
     } filterNot { case (_, singleEventRDD) => singleEventRDD.isEmpty() }
 
     logger.info(s"Received events ${eventRDDs.map(_._1)}")
 
     // aggregating all $set/$unsets for metadata fields, which are attached to items
+    /*
     val fieldsRDD: RDD[(ItemID, PropertyMap)] = PEventStore.aggregateProperties(
       appName = dsp.appName,
       entityType = "item")(sc).repartition(sc.defaultParallelism)
     //    logger.debug(s"FieldsRDD\n${fieldsRDD.take(25).mkString("\n")}")
+     */
+    logger.info(s"Received fieldsRDD ${fieldsRDD.first}")
 
     // Have a list of (actionName, RDD), for each action
     // todo: some day allow data to be content, which requires rethinking how to use EventStore
@@ -114,11 +165,13 @@ case class TrainingData(
     minEventsPerUser: Option[Int] = Some(1)) extends Serializable {
 
   override def toString: String = {
-    val a = actions.map { t =>
-      s"${t._1} actions: [count:${t._2.count()}] + sample:${t._2.take(2).toList} "
-    }.toString()
-    val f = s"Item metadata: [count:${fieldsRDD.count}] + sample:${fieldsRDD.take(2).toList} "
+    val a = actions
+      .map { t =>
+        s"${t._1} actions: [count:${t._2.count()}] + sample:${t._2.take(2).toList} "
+      }
+      .toString()
+    val f =
+      s"Item metadata: [count:${fieldsRDD.count}] + sample:${fieldsRDD.take(2).toList} "
     a + f
   }
-
 }
