@@ -28,35 +28,38 @@ import org.apache.predictionio.data.storage.PropertyMap
 import org.apache.predictionio.data.store.PEventStore
 import org.apache.predictionio.data.storage.Event
 import grizzled.slf4j.Logger
-import org.apache.predictionio.core.{ EventWindow, SelfCleaningDataSource }
+import org.apache.predictionio.core.{EventWindow, SelfCleaningDataSource}
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.json4s.JObject
 import org.json4s.DefaultFormats
 import org.json4s.native.Serialization
-import com.actionml.helpers.{ ActionID, ItemID }
+import com.actionml.helpers.{ActionID, ItemID}
 import com.actionml.helpers._
 
 /** Taken from engine.json these are passed in to the DataSource constructor
- *
- *  @param appName registered name for the app
- *  @param eventNames a list of named events expected. The first is the primary event, the rest are secondary. These
- *                   will be used to create the primary correlator and cross-cooccurrence secondary correlators.
- */
+  *
+  *  @param appName registered name for the app
+  *  @param eventNames a list of named events expected. The first is the primary event, the rest are secondary. These
+  *                   will be used to create the primary correlator and cross-cooccurrence secondary correlators.
+  */
 case class DataSourceParams(
-  appName: String,
-  eventNames: List[String], // IMPORTANT: eventNames must be exactly the same as URAlgorithmParams eventNames
-  eventWindow: Option[EventWindow],
-  minEventsPerUser: Option[Int]) // defaults to 1 event, if the user has only one thehy will not contribute to
-    // training anyway
+    appName: String,
+    eventNames: List[String], // IMPORTANT: eventNames must be exactly the same as URAlgorithmParams eventNames
+    eventWindow: Option[EventWindow],
+    minEventsPerUser: Option[Int]) // defaults to 1 event, if the user has only one thehy will not contribute to
+// training anyway
     extends Params
 
 /** Read specified events from the PEventStore and creates RDDs for each event. A list of pairs (eventName, eventRDD)
- *  are sent to the Preparator for further processing.
- *  @param dsp parameters taken from engine.json
- */
+  *  are sent to the Preparator for further processing.
+  *  @param dsp parameters taken from engine.json
+  */
 class DataSource(val dsp: DataSourceParams)
-    extends PDataSource[TrainingData, EmptyEvaluationInfo, Query, EmptyActualResult]
+    extends PDataSource[TrainingData,
+                        EmptyEvaluationInfo,
+                        Query,
+                        EmptyActualResult]
     with SelfCleaningDataSource {
 
   @transient override lazy implicit val logger: Logger = Logger[this.type]
@@ -71,7 +74,9 @@ class DataSource(val dsp: DataSourceParams)
       ("App name", appName),
       ("Event window", eventWindow),
       ("Event names", dsp.eventNames),
-      ("Min events per user", dsp.minEventsPerUser)))
+      ("Min events per user", dsp.minEventsPerUser)
+    )
+  )
 
   /** Reads events from PEventStore and create and RDD for each */
   override def readTraining(sc: SparkContext): TrainingData = {
@@ -82,36 +87,16 @@ class DataSource(val dsp: DataSourceParams)
     cleanPersistedPEvents(sc) // broken in apache-pio v0.10.0-incubating it erases all data!!!!!!
 
     val eventsRDD = PEventStore
-      .find(
-        appName = dsp.appName,
-        entityType = Some("user"),
-        eventNames = Some(eventNames),
-        targetEntityType = Some(Some("item")))(sc)
+      .find(appName = dsp.appName,
+            entityType = Some("user"),
+            eventNames = Some(eventNames),
+            targetEntityType = Some(Some("item")))(sc)
       .repartition(sc.defaultParallelism)
 
     logger.info(s"eventsRDD events ${eventsRDD.first()}")
 
-    val fieldsRDD: RDD[(ItemID, PropertyMap)] = eventsRDD
-      .filter { event =>
-        event.tags != null
-      }
-      .map { event =>
-        {
-          implicit val formats = DefaultFormats
-          val ss = """{ "categories": ["""" + event.tags.mkString(",") + """"] }"""
-          (
-            event.eventId.get + "_" + event.targetEntityId.get,
-            (ss, event.eventTime, event.eventTime))
-        }
-      }
-      .reduceByKey { (accum, item) =>
-        (
-          accum._1,
-          if (accum._2.isBefore(item._2)) accum._2 else item._2,
-          if (accum._3.isAfter(item._3)) accum._3
-          else item._3)
-      }
-      .map { case (k, v) => (k, PropertyMap.apply(v._1, v._2, v._3)) }
+    val fieldsRDD: RDD[(ItemID, PropertyMap)] = extractFieldsRddFromEventRdd(
+      eventsRDD)
 
     logger.info(s"fieldsRDD: ${fieldsRDD.first()}")
     logger.info(s"event names ${eventNames}")
@@ -151,18 +136,40 @@ class DataSource(val dsp: DataSourceParams)
     // todo: some day allow data to be content, which requires rethinking how to use EventStore
     TrainingData(eventRDDs, fieldsRDD, dsp.minEventsPerUser)
   }
+
+  def extractFieldsRddFromEventRdd(
+      eventsRDD: RDD[Event]): RDD[(ItemID, PropertyMap)] = {
+    eventsRDD
+      .filter { event =>
+        event.tags != null
+      }
+      .map { event =>
+        {
+          implicit val formats = DefaultFormats
+          val ss = """{ "categories": ["""" + event.tags.mkString(",") + """"] }"""
+          (event.targetEntityId.get, (ss, event.eventTime, event.eventTime))
+        }
+      }
+      .reduceByKey { (accum, item) =>
+        (accum._1,
+         if (accum._2.isBefore(item._2)) accum._2 else item._2,
+         if (accum._3.isAfter(item._3)) accum._3
+         else item._3)
+      }
+      .map { case (k, v) => (k, PropertyMap.apply(v._1, v._2, v._3)) }
+  }
 }
 
 /** Low level RDD based representation of the data ready for the Preparator
- *
- *  @param actions List of Tuples (actionName, actionRDD)qw
- *  @param fieldsRDD RDD of item keyed PropertyMap for item metadata
- *  @param minEventsPerUser users with less than this many events will not removed from training data
- */
-case class TrainingData(
-    actions: Seq[(ActionID, RDD[(UserID, ItemID)])],
-    fieldsRDD: RDD[(ItemID, PropertyMap)],
-    minEventsPerUser: Option[Int] = Some(1)) extends Serializable {
+  *
+  *  @param actions List of Tuples (actionName, actionRDD)qw
+  *  @param fieldsRDD RDD of item keyed PropertyMap for item metadata
+  *  @param minEventsPerUser users with less than this many events will not removed from training data
+  */
+case class TrainingData(actions: Seq[(ActionID, RDD[(UserID, ItemID)])],
+                        fieldsRDD: RDD[(ItemID, PropertyMap)],
+                        minEventsPerUser: Option[Int] = Some(1))
+    extends Serializable {
 
   override def toString: String = {
     val a = actions
